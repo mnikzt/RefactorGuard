@@ -12,6 +12,7 @@ from suncli_py.config.config import PaiCliConfig
 from suncli_py.llm.client import LlmClient
 from suncli_py.llm.factory import create_client_from_config
 from suncli_py.memory.manager import MemoryManager
+from suncli_py.refactor_agent.analysis.candidate_ranker import RankedCandidate, select_triage_candidates
 from suncli_py.refactor_agent.analysis.java_ast import AstFileAnalysis
 from suncli_py.refactor_agent.assistant.prompts import (
     explanation_system_prompt,
@@ -76,19 +77,14 @@ class RefactorLlmAssistant:
 
         toolbox = RefactorAgentToolbox(root, self._scan_ast_analyses)
         tools = RefactorAgentToolRuntime(toolbox, issues=issues)
-        decisions: list[CandidateDecision] = []
+        selected, deferred = select_triage_candidates(issues, limit=limit)
+        decisions_by_id: dict[str, CandidateDecision] = {}
         ranked: list[tuple[int, RefactorIssue]] = []
-        for index, issue in enumerate(issues):
-            if index >= limit:
-                decisions.append(
-                    CandidateDecision(
-                        candidate_id=issue.id,
-                        status=DecisionStatus.UNCERTAIN,
-                        confidence=0.0,
-                        reason=f"Candidate was not investigated because the scan limit is {limit}.",
-                    )
-                )
-                continue
+        original_index_by_id = {issue.id: index for index, issue in enumerate(issues)}
+
+        for candidate in selected:
+            issue = candidate.issue
+            index = original_index_by_id[issue.id]
 
             data = self._chat_json(
                 system=triage_system_prompt(),
@@ -110,7 +106,8 @@ class RefactorLlmAssistant:
                 root=root,
             )
             decision = _candidate_decision(root, issue, data)
-            decisions.append(decision)
+            decision = _decision_with_rank(decision, candidate)
+            decisions_by_id[issue.id] = decision
             if decision.status != DecisionStatus.ACCEPT:
                 continue
 
@@ -147,9 +144,24 @@ class RefactorLlmAssistant:
                     ),
                 )
             )
+        for candidate in deferred:
+            decisions_by_id[candidate.issue.id] = CandidateDecision(
+                candidate_id=candidate.issue.id,
+                status=DecisionStatus.UNCERTAIN,
+                confidence=0.0,
+                reason=(
+                    f"Candidate was deferred by hotspot-aware triage scheduling because the LLM budget is {limit}."
+                ),
+                rank_score=candidate.score,
+                rank_reasons=candidate.reasons,
+            )
         return TriageResult(
             issues=[issue for _, issue in sorted(ranked, key=lambda item: item[0])],
-            decisions=decisions,
+            decisions=[
+                decisions_by_id[issue.id]
+                for issue in issues
+                if issue.id in decisions_by_id
+            ],
         )
 
     def _legacy_triage_issues(self, root: Path, issues: list[RefactorIssue], *, limit: int = 20) -> list[RefactorIssue]:
@@ -390,6 +402,14 @@ def _candidate_decision(root: Path, issue: RefactorIssue, data: dict[str, Any]) 
         ]
         if isinstance(data.get("verification_strategy"), list)
         else [],
+    )
+
+
+def _decision_with_rank(decision: CandidateDecision, candidate: RankedCandidate) -> CandidateDecision:
+    return replace(
+        decision,
+        rank_score=candidate.score,
+        rank_reasons=candidate.reasons,
     )
 
 

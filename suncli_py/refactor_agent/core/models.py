@@ -149,6 +149,8 @@ class CandidateDecision:
     root_cause: str = ""
     proposed_solution: str = ""
     verification_strategy: list[str] = field(default_factory=list)
+    rank_score: float | None = None
+    rank_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -164,6 +166,8 @@ class CandidateDecision:
             root_cause=str(data.get("root_cause", "")),
             proposed_solution=str(data.get("proposed_solution", "")),
             verification_strategy=[str(item) for item in data.get("verification_strategy", [])],
+            rank_score=float(data["rank_score"]) if data.get("rank_score") is not None else None,
+            rank_reasons=[str(item) for item in data.get("rank_reasons", [])],
         )
 
 

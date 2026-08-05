@@ -1,0 +1,38 @@
+[
+  {
+    "id": "T001",
+    "project": "commons-lang",
+    "smell_type": "long_method",
+    "target_hint": "Find a method with high line count, branches, or nesting."
+  },
+  {
+    "id": "T002",
+    "project": "commons-lang",
+    "smell_type": "duplicate_code",
+    "target_hint": "Find duplicated Java logic reported by CPD or obvious copy/paste."
+  },
+  {
+    "id": "T003",
+    "project": "commons-io",
+    "smell_type": "complex_condition",
+    "target_hint": "Find a method or condition with nested or compound boolean logic."
+  },
+  {
+    "id": "T004",
+    "project": "commons-io",
+    "smell_type": "long_parameter_list",
+    "target_hint": "Approximate with scanner-supported smells if the exact smell is not available."
+  },
+  {
+    "id": "T005",
+    "project": "gson",
+    "smell_type": "feature_envy",
+    "target_hint": "Find a method that uses another project type more than its own class state."
+  },
+  {
+    "id": "T006",
+    "project": "gson",
+    "smell_type": "dead_code",
+    "target_hint": "Find a private method that appears unused."
+  }
+]

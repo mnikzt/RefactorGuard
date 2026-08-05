@@ -11,6 +11,8 @@ from pathlib import Path
 
 CommandRunner = Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]]
 
+MAX_EXEC_ARGS_CHARS = 2_000
+
 
 class JavaAstError(Exception):
     """Raised when JavaParser AST extraction is unavailable or invalid."""
@@ -104,6 +106,22 @@ class JavaParserAnalyzer:
         if not paths:
             return []
         relative_paths = [self._relative_path(path) for path in paths]
+        analyses: list[AstFileAnalysis] = []
+        current_batch: list[str] = []
+        current_size = len(str(self.root)) + 3
+        for relative_path in relative_paths:
+            quoted_size = len(_quote_arg(relative_path)) + 1
+            if current_batch and current_size + quoted_size > MAX_EXEC_ARGS_CHARS:
+                analyses.extend(self._analyze_relative_paths(current_batch))
+                current_batch = []
+                current_size = len(str(self.root)) + 3
+            current_batch.append(relative_path)
+            current_size += quoted_size
+        if current_batch:
+            analyses.extend(self._analyze_relative_paths(current_batch))
+        return analyses
+
+    def _analyze_relative_paths(self, relative_paths: list[str]) -> list[AstFileAnalysis]:
         args = " ".join([_quote_arg(str(self.root)), *[_quote_arg(path) for path in relative_paths]])
         command = [
             "mvn",

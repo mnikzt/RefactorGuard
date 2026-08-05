@@ -28,6 +28,9 @@ class FreeLlmApiClient(AbstractOpenAiCompatibleClient):
     def _get_api_key(self) -> str:
         return self._api_key
 
+    def _customize_body(self, body: dict) -> None:
+        body["stream_options"] = {"include_usage": True}
+
     @property
     def provider_name(self) -> str:
         return "freellmapi"

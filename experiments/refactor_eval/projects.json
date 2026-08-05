@@ -1,0 +1,23 @@
+[
+  {
+    "name": "commons-lang",
+    "repo": "https://github.com/apache/commons-lang.git",
+    "ref": "master",
+    "build": "mvn -q -DskipTests compile",
+    "test": "mvn -q test"
+  },
+  {
+    "name": "commons-io",
+    "repo": "https://github.com/apache/commons-io.git",
+    "ref": "master",
+    "build": "mvn -q -DskipTests compile",
+    "test": "mvn -q test"
+  },
+  {
+    "name": "gson",
+    "repo": "https://github.com/google/gson.git",
+    "ref": "main",
+    "build": "mvn -q -DskipTests compile",
+    "test": "mvn -q test"
+  }
+]

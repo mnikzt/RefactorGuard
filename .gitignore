@@ -28,6 +28,10 @@ htmlcov/
 # Type checking
 .mypy_cache/
 .ruff_cache/
+.uv-cache/
+.pytest_cache_local/
+.pytest_tmp/
+.tmp/
 
 # OS
 .DS_Store
@@ -44,3 +48,7 @@ refactor-agent-test-maven/
 
 # Environment
 .env
+
+# Evaluation workspaces
+experiments/refactor_eval/projects/
+experiments/refactor_eval/results/

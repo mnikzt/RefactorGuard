@@ -9,6 +9,7 @@ import pytest
 from loguru import logger
 
 from suncli_py.llm.models import ChatResponse, ContentPart, ToolCall, _Function
+from suncli_py.refactor_agent.analysis.candidate_ranker import rank_candidates
 from suncli_py.refactor_agent.analysis.java_ast import AstFileAnalysis
 from suncli_py.refactor_agent.assistant.llm_assistant import (
     RefactorLlmAssistant,
@@ -170,6 +171,175 @@ def test_llm_triage_requires_evidence_before_accepting_candidate(tmp_path: Path)
 
     assert result.issues == []
     assert result.decisions[0].status == DecisionStatus.UNCERTAIN
+
+
+def test_candidate_ranker_allows_real_hotspot_file_to_dominate(tmp_path: Path) -> None:
+    noisy_file = _write_java_lines(tmp_path, "src/main/java/demo/Names.java", line_count=20)
+    hotspot_file = _write_java_lines(tmp_path, "src/main/java/demo/Hotspot.java", line_count=140)
+    issues = [
+        _simple_issue(
+            "RA-0001",
+            SmellType.UNCLEAR_NAMING,
+            Severity.LOW,
+            noisy_file,
+            4,
+            4,
+            Evidence("unclear local name"),
+        ),
+        _simple_issue(
+            "RA-0002",
+            SmellType.LONG_METHOD,
+            Severity.HIGH,
+            hotspot_file,
+            10,
+            120,
+            Evidence("large method", {"lines": 111, "branches": 14, "max_nesting": 3}),
+        ),
+        _simple_issue(
+            "RA-0003",
+            SmellType.FEATURE_ENVY,
+            Severity.MEDIUM,
+            hotspot_file,
+            20,
+            70,
+            Evidence("external member use", {"source": "javaparser-symbol-solver"}),
+        ),
+    ]
+
+    ranked = rank_candidates(issues)
+
+    assert [candidate.issue.id for candidate in ranked[:2]] == ["RA-0002", "RA-0003"]
+    assert ranked[0].hotspot_score > 0
+    assert any("file hotspot" in reason for reason in ranked[1].reasons)
+
+
+def test_candidate_ranker_downranks_flat_lookup_without_filtering(tmp_path: Path) -> None:
+    source = _write_java_lines(tmp_path, "src/main/java/demo/Lookup.java", line_count=60)
+    issue = _simple_issue(
+        "RA-0100",
+        SmellType.LONG_METHOD,
+        Severity.HIGH,
+        source,
+        10,
+        53,
+        Evidence("branch-heavy method", {"lines": 44, "branches": 24, "max_nesting": 1}),
+    )
+
+    ranked = rank_candidates([issue])[0]
+
+    assert ranked.issue.id == "RA-0100"
+    assert any("flat_branch_lookup" in reason for reason in ranked.reasons)
+    assert any("defer, not reject" in reason for reason in ranked.reasons)
+
+
+def test_candidate_ranker_downranks_dense_public_api_without_filtering(tmp_path: Path) -> None:
+    source = _write_java_lines(tmp_path, "src/main/java/demo/ToStringStyle.java", line_count=2400)
+    issue = _simple_issue(
+        "RA-0101",
+        SmellType.LARGE_CLASS,
+        Severity.HIGH,
+        source,
+        1,
+        2300,
+        Evidence("large public surface", {"lines": 2300, "methods": 40, "public_methods": 30}),
+    )
+
+    ranked = rank_candidates([issue])[0]
+
+    assert ranked.issue.id == "RA-0101"
+    assert any("public_api_dense" in reason for reason in ranked.reasons)
+
+
+def test_candidate_ranker_downranks_primitive_overload_family_without_filtering(tmp_path: Path) -> None:
+    source = _write_java_lines(tmp_path, "src/main/java/demo/ArrayUtils.java", line_count=220)
+    issue = _simple_issue(
+        "RA-0102",
+        SmellType.DUPLICATE_CODE,
+        Severity.HIGH,
+        source,
+        20,
+        80,
+        Evidence(
+            "CPD duplicate",
+            {
+                "source": "pmd-cpd",
+                "overload_family": [
+                    {
+                        "declaring_type": "demo.ArrayUtils",
+                        "method_name": "contains",
+                        "signatures": ["contains(int[] array, int value)", "contains(long[] array, long value)"],
+                    }
+                ],
+            },
+        ),
+    )
+
+    ranked = rank_candidates([issue])[0]
+
+    assert ranked.issue.id == "RA-0102"
+    assert any("primitive_overload_family" in reason for reason in ranked.reasons)
+
+
+def test_llm_triage_uses_hotspot_aware_schedule_before_deferring(tmp_path: Path) -> None:
+    noisy_file = _write_java_lines(tmp_path, "src/main/java/demo/Names.java", line_count=20)
+    hotspot_file = _write_java_lines(tmp_path, "src/main/java/demo/Hotspot.java", line_count=140)
+    issues = [
+        _simple_issue(
+            "RA-0001",
+            SmellType.UNCLEAR_NAMING,
+            Severity.LOW,
+            noisy_file,
+            4,
+            4,
+            Evidence("unclear local name"),
+        ),
+        _simple_issue(
+            "RA-0002",
+            SmellType.LONG_METHOD,
+            Severity.HIGH,
+            hotspot_file,
+            10,
+            120,
+            Evidence("large method", {"lines": 111, "branches": 14, "max_nesting": 3}),
+        ),
+        _simple_issue(
+            "RA-0003",
+            SmellType.FEATURE_ENVY,
+            Severity.MEDIUM,
+            hotspot_file,
+            20,
+            70,
+            Evidence("external member use", {"source": "javaparser-symbol-solver"}),
+        ),
+    ]
+    assistant = RefactorLlmAssistant(
+        _FakeLlmClient(
+            [
+                (
+                    '{"candidate_id":"RA-0002","decision":"reject","confidence":0.7,'
+                    '"reason":"source review does not show a cohesive extractable block",'
+                    '"source_evidence":[{"file_path":"src/main/java/demo/Hotspot.java",'
+                    '"start_line":10,"end_line":12,"reason":"reviewed hotspot"}]}'
+                ),
+                (
+                    '{"candidate_id":"RA-0003","decision":"reject","confidence":0.7,'
+                    '"reason":"external calls are acceptable orchestration",'
+                    '"source_evidence":[{"file_path":"src/main/java/demo/Hotspot.java",'
+                    '"start_line":20,"end_line":22,"reason":"reviewed hotspot"}]}'
+                ),
+            ]
+        )
+    )
+
+    result = assistant.triage_issues(tmp_path, issues, limit=2)
+
+    assert [decision.candidate_id for decision in result.decisions] == ["RA-0001", "RA-0002", "RA-0003"]
+    assert result.decisions[0].status == DecisionStatus.UNCERTAIN
+    assert "deferred by hotspot-aware triage scheduling" in result.decisions[0].reason
+    assert result.decisions[1].status == DecisionStatus.REJECT
+    assert result.decisions[2].status == DecisionStatus.REJECT
+    assert result.decisions[1].rank_score is not None
+    assert result.decisions[2].rank_score is not None
 
 
 def test_plan_is_generated_by_llm_from_tool_context(
@@ -487,6 +657,16 @@ public class LargeMathService {{
     return source_path
 
 
+def _write_java_lines(root: Path, relative_path: str, *, line_count: int) -> Path:
+    source_path = root / relative_path
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["package demo;", "", "public class Sample {"]
+    lines.extend(f"    // line {index}" for index in range(4, line_count))
+    lines.append("}")
+    source_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return source_path
+
+
 def _write_minimal_repo(root: Path) -> None:
     (root / ".git").mkdir(exist_ok=True)
     (root / "pom.xml").write_text(
@@ -527,6 +707,35 @@ def _dead_code_issue(source_path: Path) -> RefactorIssue:
         recommendation="remove dead code",
         suggested_refactoring=RefactoringType.REMOVE_DEAD_CODE,
         risk_level=RiskLevel.LOW,
+    )
+
+
+def _simple_issue(
+    issue_id: str,
+    smell_type: SmellType,
+    severity: Severity,
+    source_path: Path,
+    start_line: int,
+    end_line: int,
+    evidence: Evidence,
+) -> RefactorIssue:
+    return RefactorIssue(
+        id=issue_id,
+        type=smell_type,
+        severity=severity,
+        file_path=source_path.relative_to(source_path.parents[4]).as_posix(),
+        symbol="sample",
+        start_line=start_line,
+        end_line=end_line,
+        evidence=[evidence],
+        impact="test impact",
+        recommendation="test recommendation",
+        suggested_refactoring=RefactoringType.EXTRACT_METHOD
+        if smell_type == SmellType.LONG_METHOD
+        else RefactoringType.MOVE_METHOD
+        if smell_type == SmellType.FEATURE_ENVY
+        else RefactoringType.RENAME,
+        risk_level=RiskLevel.MEDIUM if severity != Severity.LOW else RiskLevel.LOW,
     )
 
 

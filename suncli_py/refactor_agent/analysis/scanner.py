@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -643,11 +644,12 @@ class JavaSmellScanner:
         return issues
 
     def _scan_duplicate_code(self, analyses: list[JavaFileAnalysis]) -> list[RefactorIssue]:
+        analysis_snapshot = analyses
         """规则：重复代码。当前实现不自己比文本，直接委托给 PMD CPD。"""
         del analyses  # 参数保留是为了和其他 _scan_* 方法签名一致。
-        return self._scan_duplicate_code_with_cpd()
+        return self._scan_duplicate_code_with_cpd(analysis_snapshot)
 
-    def _scan_duplicate_code_with_cpd(self) -> list[RefactorIssue]:
+    def _scan_duplicate_code_with_cpd(self, analyses: list[JavaFileAnalysis]) -> list[RefactorIssue]:
         """调用 `mvn pmd:cpd-check`，解析输出里的 duplication 片段。
 
         约定：
@@ -665,8 +667,164 @@ class JavaSmellScanner:
             return []
         parsed = _parse_cpd_output(output, self.root)
         if not parsed:
+            parsed = _parse_cpd_xml(self.root / "target" / "cpd.xml", self.root)
+        if not parsed:
             raise CpdError(f"PMD CPD 执行失败且未返回可解析结果: {output[-1000:]}")
-        return parsed
+        return [_annotate_api_shape(issue, analyses) for issue in parsed]
+
+
+_JAVA_PRIMITIVE_TYPES = {
+    "boolean",
+    "byte",
+    "char",
+    "double",
+    "float",
+    "int",
+    "long",
+    "short",
+}
+
+
+def _annotate_api_shape(issue: RefactorIssue, analyses: list[JavaFileAnalysis]) -> RefactorIssue:
+    issue = _annotate_overload_family(issue, analyses)
+    return _annotate_symmetric_exception_api(issue)
+
+
+def _annotate_symmetric_exception_api(issue: RefactorIssue) -> RefactorIssue:
+    """Attach evidence for checked/unchecked exception API symmetry."""
+    locations: list[str] = []
+    for evidence in issue.evidence:
+        for location in evidence.metrics.get("duplicate_locations", []):
+            if isinstance(location, dict) and isinstance(location.get("file"), str):
+                locations.append(location["file"])
+    stems = {Path(path).stem for path in locations}
+    pairs = [
+        (stem, stem.removesuffix("RuntimeException"))
+        for stem in stems
+        if stem.endswith("RuntimeException") and stem.removesuffix("RuntimeException") + "Exception" in stems
+    ]
+    if not pairs:
+        return issue
+    return RefactorIssue(
+        id=issue.id,
+        type=issue.type,
+        severity=issue.severity,
+        file_path=issue.file_path,
+        symbol=issue.symbol,
+        start_line=issue.start_line,
+        end_line=issue.end_line,
+        evidence=[
+            *issue.evidence,
+            Evidence(
+                "文件名显示 checked/unchecked exception API 对称结构，重复可能是有意的兼容设计。",
+                {
+                    "source": "path-structure",
+                    "api_symmetry": [
+                        {"runtime": runtime, "checked": checked} for runtime, checked in pairs
+                    ],
+                },
+            ),
+        ],
+        impact=issue.impact,
+        recommendation=issue.recommendation,
+        suggested_refactoring=issue.suggested_refactoring,
+        risk_level=issue.risk_level,
+    )
+
+
+def _annotate_overload_family(issue: RefactorIssue, analyses: list[JavaFileAnalysis]) -> RefactorIssue:
+    """Attach evidence when CPD overlaps a primitive-only overload family."""
+    locations: list[tuple[str, int]] = []
+    for evidence in issue.evidence:
+        for location in evidence.metrics.get("duplicate_locations", []):
+            if isinstance(location, dict):
+                file_path = location.get("file")
+                start_line = location.get("start_line")
+                if isinstance(file_path, str) and isinstance(start_line, int):
+                    locations.append((file_path, start_line))
+
+    analysis_by_path = {analysis.relative_path: analysis for analysis in analyses}
+    methods_by_key: dict[tuple[str, str], list[JavaMethod]] = {}
+    for file_path, line in locations:
+        analysis = analysis_by_path.get(file_path)
+        if analysis is None:
+            continue
+        for method in analysis.methods:
+            if method.start_line <= line <= method.end_line:
+                methods_by_key.setdefault((method.declaring_type, method.name), []).append(method)
+
+    family: list[dict[str, object]] = []
+    for (declaring_type, method_name), methods in methods_by_key.items():
+        variants = _primitive_overload_variants(methods)
+        if len(variants) >= 2:
+            family.append(
+                {
+                    "declaring_type": declaring_type,
+                    "method_name": method_name,
+                    "signatures": [method.signature for method in variants],
+                }
+            )
+
+    if not family:
+        return issue
+    return RefactorIssue(
+        id=issue.id,
+        type=issue.type,
+        severity=issue.severity,
+        file_path=issue.file_path,
+        symbol=issue.symbol,
+        start_line=issue.start_line,
+        end_line=issue.end_line,
+        evidence=[
+            *issue.evidence,
+            Evidence(
+                "AST 识别到同类 primitive overload 家族，重复可能是 API 兼容或避免 boxing 的有意设计。",
+                {"source": "javaparser-ast", "overload_family": family},
+            ),
+        ],
+        impact=issue.impact,
+        recommendation=issue.recommendation,
+        suggested_refactoring=issue.suggested_refactoring,
+        risk_level=issue.risk_level,
+    )
+
+
+def _primitive_overload_variants(methods: list[JavaMethod]) -> list[JavaMethod]:
+    variants: list[JavaMethod] = []
+    signatures: set[tuple[str, ...]] = set()
+    for method in methods:
+        parameter_types = _parameter_types(method.signature, method.name)
+        if (
+            parameter_types is None
+            or not parameter_types
+            or not all(_is_primitive_type(item) for item in parameter_types)
+        ):
+            continue
+        if parameter_types in signatures:
+            continue
+        signatures.add(parameter_types)
+        variants.append(method)
+    return variants
+
+
+def _parameter_types(signature: str, method_name: str) -> tuple[str, ...] | None:
+    match = re.search(rf"\b{re.escape(method_name)}\s*\(([^)]*)\)", signature)
+    if match is None:
+        return None
+    parameters = [part.strip() for part in match.group(1).split(",") if part.strip()]
+    types: list[str] = []
+    for parameter in parameters:
+        parameter = re.sub(r"\bfinal\s+", "", parameter)
+        tokens = parameter.split()
+        if len(tokens) < 2:
+            return None
+        parameter_type = " ".join(tokens[:-1]).replace("...", "[]")
+        types.append(parameter_type.replace(" ", ""))
+    return tuple(types)
+
+
+def _is_primitive_type(parameter_type: str) -> bool:
+    return parameter_type.replace("[]", "") in _JAVA_PRIMITIVE_TYPES
 
 
 def _issue(
@@ -797,6 +955,51 @@ def _parse_cpd_output(output: str, root: Path) -> list[RefactorIssue]:
     if current_locations:
         issues.append(_cpd_issue(current_lines, current_locations))
     return issues
+
+
+def _parse_cpd_xml(report_path: Path, root: Path) -> list[RefactorIssue]:
+    """Parse PMD 7 CPD XML reports when console output only points to target/cpd.xml."""
+    if not report_path.is_file():
+        return []
+    try:
+        tree = ET.parse(report_path)
+    except ET.ParseError:
+        return []
+
+    issues: list[RefactorIssue] = []
+    for duplication in tree.getroot().iter():
+        if _local_name(duplication.tag) != "duplication":
+            continue
+        try:
+            line_count = int(duplication.attrib.get("lines", "0"))
+        except ValueError:
+            line_count = 0
+
+        locations: list[tuple[str, int]] = []
+        for child in duplication:
+            if _local_name(child.tag) != "file":
+                continue
+            path_text = child.attrib.get("path", "")
+            try:
+                start_line = int(child.attrib.get("line") or child.attrib.get("beginline") or "0")
+            except ValueError:
+                start_line = 0
+            if not path_text or start_line <= 0:
+                continue
+            file_path = Path(path_text)
+            try:
+                relative = file_path.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                relative = file_path.as_posix()
+            locations.append((relative, start_line))
+
+        if locations:
+            issues.append(_cpd_issue(line_count, locations))
+    return issues
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
 
 def _cpd_issue(line_count: int, locations: list[tuple[str, int]]) -> RefactorIssue:
